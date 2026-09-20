@@ -45,6 +45,13 @@ from swat_m_block import (
 )
 ```
 
+The frozen element type of both views' ``blocks`` attributes lives in the module that defines
+it, ``swat_m_block.content_schedule``:
+
+```python
+from swat_m_block.content_schedule import LogicalBlockSnapshot
+```
+
 Pipeline:
 
 ```text
@@ -55,8 +62,8 @@ LogicalBlockRunView (level, blocks, items_per_block)
 bind_block_allocation(run, plan, side=...)          each bin -> run.blocks[start:stop]
         |
         v
-sample_bin_interior_points(bound, privacy_epsilon=..., seed=...)
-        |                                           one pinned interior point per bin
+sample_bin_interior_points(bound)                   one pinned interior point per bin
+        |                                           (epsilon/seed/domain not caller-set)
         v
 build_abstract_merge_schedule(source, target)       preload bin 0 per side, then
         |                                           follow the sorted tagged stream
@@ -70,14 +77,33 @@ accepted `source = L` (newer) → `target = L + 1` (older) identity, binds both 
 both sides' interior points from each side's own M2 config (`privacy_epsilon` and `seed`),
 and derives the schedule.
 
+The sampling helper's full current signature is
+
+```python
+sample_bin_interior_points(bound, *, interior_index_sampler=None)
+```
+
+and nothing about the randomness is caller-controlled:
+
+- `privacy_epsilon` is `bound.plan.config.privacy_epsilon` — the epsilon of the frozen plan
+  the bin was bound from, never a parameter;
+- `seed` is `bound.plan.config.seed`, likewise;
+- the RNG domain is fixed by `bound.side` through `interior_stream_domain`: `source` →
+  `swat-m-block/interior/source`, `target` → `swat-m-block/interior/target`.
+
+A caller therefore cannot pair an allocation with an unrelated epsilon or seed, reuse one of
+the M2 domains, or put both sides on the same stream.  The only exposed knob is the
+`interior_index_sampler` test seam, which picks an index inside a bin's already-validated
+record list and cannot escape the config/side binding.
+
 ## 4. `LogicalBlockRunView` validation
 
 The view preserves the real block boundaries that M1's logical run view deliberately drops.
-Construction performs zero storage I/O and refuses:
+Construction performs zero storage I/O, snapshots its input at once, and refuses:
 
 - a `level` that is not a plain non-negative int;
 - an `items_per_block` that is not a plain int ≥ 1;
-- any element that is not an `enhanced_letindex.Block`;
+- any element that is neither an `enhanced_letindex.Block` nor a `LogicalBlockSnapshot`;
 - a block whose capacity differs from `items_per_block`;
 - an empty block (a logical run holds non-empty blocks only);
 - a block whose keys are not strictly increasing;
@@ -90,12 +116,31 @@ Construction performs zero storage I/O and refuses:
 An empty run (zero blocks) is legal, as is a single block.  `records()`, `keys()` and
 `records_of(start, stop)` expose the flattened trusted content.
 
+**The view is immutable, not merely frozen.**  A frozen dataclass holding the caller's
+`enhanced_letindex.Block` objects would still be mutable through them, so construction
+replaces every input `Block` with the frozen `LogicalBlockSnapshot` in
+
+```text
+LogicalBlockSnapshot: block_id, capacity, records (immutable tuple), size,
+                      is_empty, is_full, min_key, max_key
+```
+
+and validates the snapshots (not the live blocks).  `LogicalBlockRunView.blocks` is a
+`Tuple[LogicalBlockSnapshot, ...]`; the caller keeps ownership of their own `Block` objects,
+and `Block.add_record(...)` afterwards cannot change `records()`, `keys()`, the binding, the
+interior points or the schedule.  The class is importable from
+`swat_m_block.content_schedule`; `enhanced_letindex.Block` itself is untouched.  (`Record` and
+`RecordKey` are already frozen in the substrate, so copying the tuple is sufficient; record
+*values* are opaque payloads and are never inspected by M3.)
+
 ## 5. Binding an M2 plan to contents
 
 Legal only when `plan.block_count == run.block_count`.  Each M2 bin's `[start, stop)` binds
-`run.blocks[start:stop]`, and `BoundBlockBin` carries the bin index, the rank interval, the
-real `Block` objects, `real_block_count`, `dummy_block_count` and `bin_capacity_blocks` —
-nothing physical.  Binding guarantees:
+`run.blocks[start:stop]`, and `BoundBlockBin` carries the bin index, the rank interval, its
+`Tuple[LogicalBlockSnapshot, ...]` (never a reference to a caller-owned `Block`),
+`real_block_count`, `dummy_block_count` and `bin_capacity_blocks` — nothing physical.  The
+snapshots were taken when the view was constructed, so binding re-validates bin-local state
+and cannot be invalidated afterwards.  Binding guarantees:
 
 - every real block rank bound exactly once (`bound_ranks() == 0..n-1`);
 - no block duplicated or omitted;
@@ -103,7 +148,8 @@ nothing physical.  Binding guarantees:
 - the M2 evidence carried through **unchanged** (the properties read straight off the frozen
   M2 plan object, so it cannot be silently rewritten);
 - `real_count + dummy_count == bin_capacity_blocks` per bin, with padding kept as a count —
-  no dummy block is materialised, and no `dummy_blocks` field exists;
+  no dummy block is materialised, and no `dummy_blocks` field exists (`real_count` counts
+  real blocks, so the padding count is the only dummy evidence in the binding);
 - the bin's flattened keys strictly increase across its blocks (re-validated).
 
 Fixtures with an exhausted run produce trailing bins with `real_block_count == 0`; those bins
@@ -142,6 +188,8 @@ swat-m-block/interior/source
 swat-m-block/interior/target
 ```
 
+The domain is chosen internally from `bound.side` (`interior_stream_domain`) and neither it
+nor `privacy_epsilon`/`seed` is a public parameter: both come from `bound.plan.config`.
 `derive_stream_seed(seed, domain)` (SHA-256 based) makes the two sides' streams different
 even when both M2 configs carry the same seed, and makes all four domains in the package
 (two interior, two M2) mutually distinct.  No module-global mutable RNG state exists, and no
