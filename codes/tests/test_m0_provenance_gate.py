@@ -61,8 +61,12 @@ BYTE_IDENTICAL_TEST_FILES = (
 DERIVED_TEST_FILES = ("test_incremental_merge.py", "test_pgm_rank_certificate.py")
 DERIVATION_MARKER = "DERIVED TEST, NOT BYTE-IDENTICAL IMPORT"
 
-#: Tests written for this repository (M0 gates + the M1 focused suite).
-REPO_TEST_FILES = ("test_m0_provenance_gate.py", "test_m1_functional_oracle.py")
+#: Tests written for this repository (M0 gates + the M1 / M2 focused suites).
+REPO_TEST_FILES = (
+    "test_m0_provenance_gate.py",
+    "test_m1_functional_oracle.py",
+    "test_m2_block_bin_allocation.py",
+)
 
 
 def _load_verify_module():
@@ -291,14 +295,15 @@ def test_imported_tests_do_not_import_an_excluded_defense_module():
 # ---------------------------------------------------------------------------
 
 
-def test_swat_m_block_package_holds_only_the_m1_functional_oracle():
-    """M0 shipped a marker-only package; M1 (Issue #2) authorises the oracle module.
+def test_swat_m_block_holds_only_the_authorised_milestone_modules():
+    """Only modules an authorised milestone has added may exist in this package.
 
-    The package must still hold nothing but its initialiser and the M1 oracle: no second
-    module may appear without its own milestone and decision record.
+    M0 shipped a marker; M1 (Issue #2) added the functional oracle; M2 (Issue #4) added the
+    distribution kernel and the block-bin allocation planner.  A further module needs its
+    own milestone and decision record.
     """
     assert {item.name for item in SWAT_PACKAGE.glob("*.py")} == {
-        "__init__.py", "functional_oracle.py"
+        "__init__.py", "functional_oracle.py", "distribution.py", "bin_allocator.py"
     }
     path = SWAT_PACKAGE / "__init__.py"
     source = path.read_text(encoding="utf-8")
@@ -309,24 +314,27 @@ def test_swat_m_block_package_holds_only_the_m1_functional_oracle():
     ]
     assert defined == [], "the package initialiser must not define behaviour"
     assert "functional_merge_oracle" in source
+    assert "allocate_block_bins" in source
     assert "__all__" in source
 
 
-def test_no_swat_privacy_or_physical_mechanism_is_implemented():
-    """M1 authorises a *functional* oracle only; no mechanism may be implemented.
+def test_no_excluded_swat_mechanism_is_implemented():
+    """Repo-wide guard on the mechanisms still excluded after M2.
 
-    The M0 guard refused any SWAT-M-Block algorithm.  M1 (Issue #2) legitimately adds the
-    logical oracle, so this guard now refuses the mechanisms M1 explicitly excludes: the
-    noisy/padded allocation, the DO merge, the padding, the output permutation, the PRP
-    writeback, de-amortisation and every physical/observational surface.
+    The M0 guard refused any SWAT-M-Block algorithm; M1 (Issue #2) authorised the logical
+    oracle and M2 (Issue #4) authorises the stochastic block-bin allocation planner, so the
+    tokens naming those authorised mechanisms were removed here.  Everything M2 still
+    excludes stays refused: the full DO data path and the DO merge, the physical surface
+    (storage, trace, slot), the output permutation, the PRP writeback, de-amortisation, the
+    DP interior point and any (epsilon, delta) claim.
     """
     forbidden = (
         "DOAllocate", "DOMerge", "DOMerger", "differential_oblivious",
-        "do_allocate", "do_merge", "bin_allocator", "BinAllocator",
-        "noisy_allocat", "output_shuffle", "oblivious_shuffle", "bitonic",
+        "do_allocate", "do_merge",
+        "output_shuffle", "oblivious_shuffle", "bitonic",
         "sorting_network", "deamortiz", "de_amortiz", "epsilon_delta",
         "UntrustedStorage", "TraceEvent", "TraceOperation", "SlotId",
-        "prp_writeback", "padded_bin", "physical_slot",
+        "prp_writeback", "physical_slot", "interior_point", "DPInteriorPoint",
     )
     owned = [
         path for path in _iter_repo_files(".py")
@@ -380,16 +388,40 @@ def test_decision_0002_freezes_the_contract_without_claiming_differential_oblivi
     assert SWAT_REFERENCE_COMMIT in text
 
 
-def test_project_state_records_m1_as_current_and_m2_as_not_started():
+def test_project_state_records_m2_as_current_and_m3_as_not_started():
     text = _normalised(REPO_ROOT / "PROJECT-STATE.md")
     assert "M0 — repository / bootstrap freeze" in text
-    assert "M1 — Functional SWAT-M-Block oracle" in text
-    assert "M2 — SWAT-style noisy/padded block-bin allocation" in text
-    assert "NOT AUTHORIZED by M1 and NOT STARTED" in text
+    assert "M1 — functional SWAT-M-Block oracle" in text
+    assert "M2 — SWAT-style block-bin allocation planner" in text
+    assert ("M3 — Bind block-bin plans to trusted contents and build the SWAT-M-Block "
+            "merge/read schedule") in text
+    assert "NOT AUTHORIZED by M2 and NOT STARTED" in text
     for item in (
-        "noisy bin allocation / padded bins", "DOAllocate / DOMerge",
-        "dummy / cover block I/O", "output oblivious shuffle",
+        "the DOAllocate data path", "DOMerge / cross-run merge schedule",
+        "DP interior point and key/interior-point binding (deferred to M3)",
+        "dummy / cover physical I/O", "output blocks and output oblivious shuffle",
         "PRP writeback / physical publication", "de-amortisation",
-        "physical-slot scheduling of any kind", "attacks", "performance experiments",
+        "physical-slot scheduling of any kind", "attacks",
+        "benchmarks / performance experiments", "privacy theorem claim",
     ):
         assert item in text, item
+
+
+def test_decision_0004_freezes_the_twelve_m2_points():
+    text = _normalised(REPO_ROOT / "decisions" / "0004-m2-block-bin-allocation.md")
+    assert "Status: ACCEPTED" in text
+    for phrase in (
+        "One allocation item is one logical LETIndex block",
+        "Atomic bucket capacity is one block",
+        "measured in blocks",
+        "The pinned SWAT source is the provenance basis",
+        "not claimed bit-identical to C++",
+        "No AES/datum byte alignment in the abstract block planner",
+        "explicit failure, never silently repaired",
+        "M2 is not full DOAllocate",
+        "The DP interior point is deferred to M3",
+        "No physical I/O and no observable surface",
+        "No formal privacy theorem claim",
+        "M3 is not authorised by M2",
+    ):
+        assert phrase in text, phrase
