@@ -181,9 +181,10 @@ ALL_FIXTURES = {
 #: planner, whose own guards live in ``test_m2_block_bin_allocation.py``.
 M1_MODULE = "functional_oracle.py"
 
-#: The package content authorised so far (M0 marker + M1 oracle + M2 planner).
+#: The package content authorised so far (M0 marker + M1 oracle + M2 planner + M3
+#: content-bound bin schedule).
 SWAT_MODULES = ("__init__.py", "functional_oracle.py", "distribution.py",
-                "bin_allocator.py")
+                "bin_allocator.py", "content_schedule.py")
 
 
 def _iter_swat_modules():
@@ -751,7 +752,7 @@ def test_g_the_m1_oracle_uses_no_randomness():
                                 "urandom", "token_bytes"}, path.name
 
 
-def test_g_the_package_holds_the_m1_oracle_and_the_m2_planner_only():
+def test_g_the_package_holds_only_the_authorised_milestone_modules():
     assert {path.name for path in _iter_swat_modules()} == set(SWAT_MODULES)
     tree = ast.parse(_m1_module().read_text(encoding="utf-8"))
     classes = [node.name for node in tree.body if isinstance(node, ast.ClassDef)]

@@ -3,7 +3,7 @@
 ## Current milestone
 
 ```text
-M2 — SWAT-style block-bin allocation planner (noisy/padded bins)
+M3 — Content-bound SWAT-M-Block bin schedule
 ```
 
 ## Accepted
@@ -27,9 +27,8 @@ M2 — SWAT-style block-bin allocation planner (noisy/padded bins)
 - **exact logical semantics** — record-level exact newer-wins sorted union, canonical
   output block packing, canonical PGM, driven through the frozen
   `enhanced_letindex.incremental_merge` / `pgm` machinery rather than re-implemented.
-- **M1 focused tests** — `codes/tests/test_m1_functional_oracle.py`.
 
-### M2 — SWAT-style block-bin allocation planner (Issue #4)
+### M2 — SWAT-style block-bin allocation planner (Issue #4, CLOSED, PR #5 merged)
 
 - **the planner** — `codes/src/swat_m_block/distribution.py` (pinned SWAT distribution and
   sizing kernel) and `codes/src/swat_m_block/bin_allocator.py` (the plan)
@@ -37,65 +36,84 @@ M2 — SWAT-style block-bin allocation planner (noisy/padded bins)
 - **frozen adaptation boundary** — one allocation item is one logical LETIndex block and
   the atomic bucket capacity is one block, so bin capacity, bin loads and every
   prefix/error quantity are measured in **blocks**.
-- **public API** — `SwatBlockAllocationConfig`, `swat_reference_config`,
-  `BlockBinPlan`, `BlockAllocationPlan`, `BlockAllocationError`,
-  `InsufficientSampledCapacity`, `allocate_block_bins`, `compute_bin_capacity_blocks`,
-  `compute_bin_count`, `compute_factor`, `compute_noisy_prefix_sums`, `compute_weight`,
-  `geom_conv`, `GeometricLoadSampler`, `LaplaceSampler`, `derive_stream_seed`,
-  `ATOMIC_BUCKET_CAPACITY_BLOCKS`.
 - **reference geometry** — for `lambda = 512`, `privacy_epsilon = 1.0`,
   `privacy_delta = 1e-12`: `bin_capacity_blocks Z = 16`,
   `factor = 0.12829670090910578`, `bin_count = ceil(factor * n)`.
-- **M2 focused tests** — `codes/tests/test_m2_block_bin_allocation.py`.
+
+### M3 — content-bound SWAT-M-Block bin schedule (Issue #6)
+
+- **the schedule** — `codes/src/swat_m_block/content_schedule.py`
+  (`decisions/0005-m3-content-bound-bin-schedule.md`,
+  `docs/m3-content-bound-bin-schedule.md`).
+- **frozen granularities** — a block is the allocation / future I/O unit, a record is the
+  trusted merge comparison unit.  No block representative key is introduced.
+- **public API** — `LogicalBlockRunView`, `BoundBlockBin`, `BoundBlockAllocation`,
+  `InteriorPoint`, `TaggedBinInteriorPoint`, `AbstractBinRead`,
+  `SwatBlockMergeSchedule`, `ContentScheduleError`, `DUMMY_POS_INF`, `SOURCE`, `TARGET`,
+  `bind_block_allocation`, `sample_bin_interior_points`, `interior_point_weights`,
+  `interior_point_sort_key`, `sorted_tagged_interior_points`,
+  `build_abstract_merge_schedule`, `plan_swat_block_merge_schedule`.
+- **interior points** — sampled from the bin's actual record keys with the pinned
+  `baseExp ** (min(i, load - i) + 1)` weighting; an exhausted bin uses `DUMMY_POS_INF`.
+- **abstract schedule** — `(side, bin_index)` fetch order only: preload bin 0 of each side,
+  then follow the pinned `(interior point, signed tag)` stream; every planned bin of each
+  side exactly once.
 
 ## Implemented in the repository
 
 ```text
 codes/src/enhanced_letindex/   frozen common substrate (35 manifest-covered files)
-codes/src/swat_m_block/        M1 functional oracle + M2 block-bin allocation planner
-codes/tests/                   13 imported + 2 derived + 3 repo test modules
+codes/src/swat_m_block/        M1 functional oracle, M2 block-bin planner,
+                               M3 content-bound bin schedule
+codes/tests/                   13 imported + 2 derived + 4 repo test modules
 provenance/                    manifest + verification script
 ```
 
 ## Not implemented
 
+- physical `SlotId` scheduling / physical staging of padded bins
+- temporary padded-bin physical materialization
+- physical dummy / cover block I/O
 - the `DOAllocate` data path (ciphertext handling, SGX/AES, bitonic sort of decrypted data,
   bin publication)
-- `DOMerge` / cross-run merge schedule
-- DP interior point and key/interior-point binding (deferred to M3)
-- dummy / cover physical I/O
-- output blocks and output oblivious shuffle
-- `PRP` writeback / physical publication
+- `DOMerge`
+- the record-unit safe-output frontier (the pinned `newCnt` arithmetic)
+- the bounded trusted merge buffer
+- output block construction / output oblivious shuffle
+- `PRP` publication / level retirement
 - de-amortisation
-- physical-slot scheduling of any kind
 - attacks
 - benchmarks / performance experiments
 - any `(epsilon, delta)` privacy theorem claim
 
 The M1 oracle performs **zero** `UntrustedStorage` access, emits **zero** `TraceEvent`,
 addresses **zero** physical `SlotId`, allocates **no** dummy or cover element and uses
-**zero** randomness.  The M2 planner uses seeded, planner-owned randomness to construct a
-plan, but still performs **zero** `UntrustedStorage` access, emits **zero** `TraceEvent` and
-schedules **zero** physical `SlotId` — the plan is a description of intended block
-placement, not an REE observation.
+**zero** randomness.  The M2 planner and the M3 binder use seeded, planner-owned randomness
+to construct a plan and to sample interior points, but still perform **zero**
+`UntrustedStorage` access, emit **zero** `TraceEvent` and schedule **zero** physical
+`SlotId`: these are descriptions of intended placement, not REE observations.
 
-## Out of scope for M2
+## Out of scope for M3
 
 - No EnhancedLETIndex modification; the source repository is untouched.
 - No submodule / subtree / pip / git dependency between the two repositories.
 - No original SWAT code was ported (provenance only, `PROVENANCE.md` §7).
-- No physical schedule, no key binding, no theorem claim.
+- No physical schedule, no merge execution, no output, no theorem claim.
 
 ## Next authorized milestone
 
 ```text
-M3 — Bind block-bin plans to trusted contents and build the SWAT-M-Block merge/read schedule
+M4 — Physically stage/fetch padded bins and implement the trusted bounded merge executor
 ```
 
-**NOT AUTHORIZED by M2 and NOT STARTED.** M3 must not begin before it is explicitly
-authorized by its own issue.
+**NOT AUTHORIZED by M3 and NOT STARTED.** M4 must not begin before it is explicitly
+authorized by its own issue.  In particular M4 must separately resolve: physical
+padded-bin materialization without accidental rank → slot leakage; dummy block
+representation and physical reads; mapping from abstract bin fetch to an REE trace;
+block-unit noisy-prefix evidence vs the record-unit safe-output frontier; bounded trusted
+merge-buffer correctness; and the eventual output publication / oblivious shuffle boundary.
 
-## Verification snapshot (M2)
+## Verification snapshot (M3)
 
 ```text
 source commit (EnhancedLETIndex) : 4e68be75b0ac45e09ce6da8f6d587490fea4f35e
@@ -104,9 +122,11 @@ frozen substrate                 : 35 files, SHA-256 manifest, unchanged since M
 M1 implementation                : codes/src/swat_m_block/functional_oracle.py
 M2 implementation                : codes/src/swat_m_block/distribution.py
                                    codes/src/swat_m_block/bin_allocator.py
-M2 public entry point            : allocate_block_bins
-reference geometry (block units) : Z = 16, factor = 0.12829670090910578
-physical I/O / trace events      : 0 / 0 (instrumented, see the M1 and M2 tests)
-randomness                       : seeded, planner-owned, deterministic; not C++ bit-identical
+M3 implementation                : codes/src/swat_m_block/content_schedule.py
+M3 public entry point            : plan_swat_block_merge_schedule
+M3 schedule granularity          : (side, bin_index) abstract bin fetch order
+physical I/O / trace events      : 0 / 0 (instrumented, see the M1 / M2 / M3 tests)
+randomness                       : seeded, planner-owned, domain-separated, deterministic;
+                                   not claimed C++ bit-identical
 SWAT privacy theorem claimed     : none
 ```

@@ -61,11 +61,12 @@ BYTE_IDENTICAL_TEST_FILES = (
 DERIVED_TEST_FILES = ("test_incremental_merge.py", "test_pgm_rank_certificate.py")
 DERIVATION_MARKER = "DERIVED TEST, NOT BYTE-IDENTICAL IMPORT"
 
-#: Tests written for this repository (M0 gates + the M1 / M2 focused suites).
+#: Tests written for this repository (M0 gates + the M1 / M2 / M3 focused suites).
 REPO_TEST_FILES = (
     "test_m0_provenance_gate.py",
     "test_m1_functional_oracle.py",
     "test_m2_block_bin_allocation.py",
+    "test_m3_content_bound_bin_schedule.py",
 )
 
 
@@ -299,11 +300,13 @@ def test_swat_m_block_holds_only_the_authorised_milestone_modules():
     """Only modules an authorised milestone has added may exist in this package.
 
     M0 shipped a marker; M1 (Issue #2) added the functional oracle; M2 (Issue #4) added the
-    distribution kernel and the block-bin allocation planner.  A further module needs its
-    own milestone and decision record.
+    distribution kernel and the block-bin allocation planner; M3 (Issue #6) added the
+    content-bound bin schedule.  A further module needs its own milestone and decision
+    record.
     """
     assert {item.name for item in SWAT_PACKAGE.glob("*.py")} == {
-        "__init__.py", "functional_oracle.py", "distribution.py", "bin_allocator.py"
+        "__init__.py", "functional_oracle.py", "distribution.py", "bin_allocator.py",
+        "content_schedule.py",
     }
     path = SWAT_PACKAGE / "__init__.py"
     source = path.read_text(encoding="utf-8")
@@ -315,18 +318,19 @@ def test_swat_m_block_holds_only_the_authorised_milestone_modules():
     assert defined == [], "the package initialiser must not define behaviour"
     assert "functional_merge_oracle" in source
     assert "allocate_block_bins" in source
+    assert "plan_swat_block_merge_schedule" in source
     assert "__all__" in source
 
 
 def test_no_excluded_swat_mechanism_is_implemented():
     """Repo-wide guard on the mechanisms still excluded after M2.
 
-    The M0 guard refused any SWAT-M-Block algorithm; M1 (Issue #2) authorised the logical
-    oracle and M2 (Issue #4) authorises the stochastic block-bin allocation planner, so the
-    tokens naming those authorised mechanisms were removed here.  Everything M2 still
-    excludes stays refused: the full DO data path and the DO merge, the physical surface
-    (storage, trace, slot), the output permutation, the PRP writeback, de-amortisation, the
-    DP interior point and any (epsilon, delta) claim.
+    Each milestone narrows this guard by removing the tokens naming the mechanism it
+    authorises: M1 (Issue #2) the logical oracle, M2 (Issue #4) the stochastic block-bin
+    allocation planner, M3 (Issue #6) content binding and interior points.  Everything still
+    excluded stays refused repo-wide: the DO data path and the DO merge, the physical
+    surface (storage, trace, slot), the output permutation, the PRP writeback, the
+    de-amortisation, the record-unit safe-output frontier and any (epsilon, delta) claim.
     """
     forbidden = (
         "DOAllocate", "DOMerge", "DOMerger", "differential_oblivious",
@@ -334,7 +338,7 @@ def test_no_excluded_swat_mechanism_is_implemented():
         "output_shuffle", "oblivious_shuffle", "bitonic",
         "sorting_network", "deamortiz", "de_amortiz", "epsilon_delta",
         "UntrustedStorage", "TraceEvent", "TraceOperation", "SlotId",
-        "prp_writeback", "physical_slot", "interior_point", "DPInteriorPoint",
+        "prp_writeback", "physical_slot", "safe_output", "bounded_buffer",
     )
     owned = [
         path for path in _iter_repo_files(".py")
@@ -388,23 +392,47 @@ def test_decision_0002_freezes_the_contract_without_claiming_differential_oblivi
     assert SWAT_REFERENCE_COMMIT in text
 
 
-def test_project_state_records_m2_as_current_and_m3_as_not_started():
+def test_project_state_records_m3_as_current_and_m4_as_not_started():
     text = _normalised(REPO_ROOT / "PROJECT-STATE.md")
     assert "M0 — repository / bootstrap freeze" in text
     assert "M1 — functional SWAT-M-Block oracle" in text
     assert "M2 — SWAT-style block-bin allocation planner" in text
-    assert ("M3 — Bind block-bin plans to trusted contents and build the SWAT-M-Block "
-            "merge/read schedule") in text
-    assert "NOT AUTHORIZED by M2 and NOT STARTED" in text
+    assert "M3 — Content-bound SWAT-M-Block bin schedule" in text
+    assert ("M4 — Physically stage/fetch padded bins and implement the trusted bounded "
+            "merge executor") in text
+    assert "NOT AUTHORIZED by M3 and NOT STARTED" in text
     for item in (
-        "the DOAllocate data path", "DOMerge / cross-run merge schedule",
-        "DP interior point and key/interior-point binding (deferred to M3)",
-        "dummy / cover physical I/O", "output blocks and output oblivious shuffle",
-        "PRP writeback / physical publication", "de-amortisation",
-        "physical-slot scheduling of any kind", "attacks",
+        "physical SlotId scheduling", "temporary padded-bin physical materialization",
+        "physical dummy / cover block I/O", "the DOAllocate data path", "DOMerge",
+        "the record-unit safe-output frontier", "the bounded trusted merge buffer",
+        "output block construction / output oblivious shuffle",
+        "PRP publication / level retirement", "de-amortisation", "attacks",
         "benchmarks / performance experiments", "privacy theorem claim",
     ):
         assert item in text, item
+
+
+def test_decision_0005_freezes_the_fourteen_m3_points():
+    text = _normalised(REPO_ROOT / "decisions" / "0005-m3-content-bound-bin-schedule.md")
+    assert "Status: ACCEPTED" in text
+    for phrase in (
+        "block is the allocation / I/O unit, record is the trusted comparison unit",
+        "binds exactly the contiguous logical blocks it covers",
+        "No block representative key is introduced",
+        "sampled from the bin's actual record keys",
+        "DUMMY_POS_INF",
+        "min(i, load - i) + 1",   # the pinned weight exponent
+        "reproduced verbatim",
+        "deterministic and domain-separated",
+        "Signed-tag tie ordering matches the pinned DOMerge pair ordering",
+        "abstract bin-read order only",
+        "Zero physical, slot and trace behaviour",
+        "not reinterpreted as record-unit safe-output prefixes",
+        "M1 remains the only exact newer-wins output oracle",
+        "No privacy theorem claim",
+        "M4 is not authorized by M3",
+    ):
+        assert phrase in text, phrase
 
 
 def test_decision_0004_freezes_the_twelve_m2_points():

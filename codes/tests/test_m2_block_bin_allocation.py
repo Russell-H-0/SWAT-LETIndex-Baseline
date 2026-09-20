@@ -905,9 +905,14 @@ def test_i_the_allocator_never_constructs_a_physical_object():
     assert not hasattr(plan, "trace")
 
 
-def test_i_m2_adds_no_third_module_and_keeps_the_m1_oracle_intact():
+def test_i_m2_adds_no_module_of_its_own_beyond_the_planner():
+    """M2 adds exactly the kernel and the planner; later milestones add their own.
+
+    (M3, Issue #6, subsequently adds ``content_schedule.py``, which has its own guard.)
+    """
     assert {path.name for path in SWAT_PACKAGE.glob("*.py")} == {
-        "__init__.py", "functional_oracle.py", "distribution.py", "bin_allocator.py"
+        "__init__.py", "functional_oracle.py", "distribution.py", "bin_allocator.py",
+        "content_schedule.py",
     }
 
 
