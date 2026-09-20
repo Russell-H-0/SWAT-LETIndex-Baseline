@@ -59,13 +59,30 @@ M3 — Content-bound SWAT-M-Block bin schedule
   then follow the pinned `(interior point, signed tag)` stream; every planned bin of each
   side exactly once.
 
+### QA-1 — post-M3 differential regression sweep (Issue #8, PR open, not yet reviewed)
+
+- **the harness** — `codes/tools/post_m3_regression_sweep.py` with
+  `codes/tests/test_post_m3_regression_sweep.py` and `docs/post-m3-regression-sweep.md`.
+- **what it is** — a stabilization campaign over the already accepted M1/M2/M3 contracts.  It
+  freezes no new semantics, establishes no new decision record and implements no mechanism; it
+  re-derives the accepted behaviour from independently written evaluators (a dict-based exact
+  newer-wins evaluator, arithmetic canonical packing, and an independent simulator of the
+  pinned `DOMerge` preload/`if`/`else if` fetch loop) and checks the shipped implementations
+  against them over a deterministic generated sweep.
+- **status** — QA only, additive.  It does not change the current algorithmic milestone, does
+  not authorize M4, and does not modify any module under `codes/src/swat_m_block/` or any of
+  the 35 manifest-covered frozen substrate files.
+
 ## Implemented in the repository
 
 ```text
 codes/src/enhanced_letindex/   frozen common substrate (35 manifest-covered files)
 codes/src/swat_m_block/        M1 functional oracle, M2 block-bin planner,
                                M3 content-bound bin schedule
+codes/tools/                   QA-1 post-M3 regression sweep (stabilization only;
+                               not part of the production package)
 codes/tests/                   13 imported + 2 derived + 4 repo test modules
+                               + the QA-1 sweep tests
 provenance/                    manifest + verification script
 ```
 
