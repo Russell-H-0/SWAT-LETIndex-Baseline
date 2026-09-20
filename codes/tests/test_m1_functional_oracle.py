@@ -414,28 +414,54 @@ SCHEDULES = (
 
 
 @pytest.mark.parametrize("schedule", SCHEDULES)
-def test_e_the_result_is_invariant_to_the_advance_schedule(schedule):
+def test_e_the_whole_result_is_invariant_to_the_advance_schedule(schedule):
+    """Issue #2 invariant 6 at full strength: the frozen result must compare EQUAL.
+
+    Field-by-field comparison is not enough.  Any step-decomposition evidence embedded in
+    the result would make two logically identical merges compare unequal, so the whole
+    frozen dataclass is compared.
+    """
     reference = merge(BASE_SOURCE, BASE_TARGET)
     result = merge(BASE_SOURCE, BASE_TARGET, schedule=schedule)
+    assert result == reference
     assert result.records() == reference.records()
     assert block_sizes(result) == block_sizes(reference)
     assert result.pgm == reference.pgm
-    assert (result.record_count, result.block_count, result.duplicate_count) == (
-        reference.record_count, reference.block_count, reference.duplicate_count
-    )
+
+
+def test_e_the_oracle_result_carries_no_step_decomposition_evidence():
+    """The corrected contract: the public logical result has no schedule field at all."""
+    fields = set(FunctionalMergeOracleResult.__dataclass_fields__)
+    assert "advance_schedule" not in fields
+    assert fields == {
+        "source_level", "target_level", "items_per_block", "epsilon", "record_count",
+        "block_count", "duplicate_count", "blocks", "pgm", "first_key", "last_key",
+    }
 
 
 def test_e_the_default_schedule_policy_is_a_single_drain_budget():
-    result = merge(BASE_SOURCE, BASE_TARGET)
+    """The applied budgets are evaluator evidence from the helper, not result state."""
     assert DEFAULT_SCHEDULE_POLICY == "drain"
-    assert result.advance_schedule == (24,)  # 12 + 12 input records
-    assert len(result.advance_schedule) == 1
+    job = IncrementalMergeJob.begin(
+        view(SOURCE_LEVEL, BASE_SOURCE), view(TARGET_LEVEL, BASE_TARGET),
+        items_per_block=ITEMS_PER_BLOCK, epsilon=PGM_EPSILON,
+    )
+    blocks, applied = collect_output_blocks(job)
+    assert applied == (24,)  # 12 + 12 input records, one budget
+    assert len(applied) == 1
+    assert flatten_blocks(blocks) == independent_oracle(BASE_SOURCE, BASE_TARGET)
 
 
 def test_e_a_consumed_schedule_is_drained_to_completion():
     result = merge(BASE_SOURCE, BASE_TARGET, schedule=(1,))
     assert result.records() == independent_oracle(BASE_SOURCE, BASE_TARGET)
-    assert len(result.advance_schedule) == BASE_EXPECTED_RECORDS
+    job = IncrementalMergeJob.begin(
+        view(SOURCE_LEVEL, BASE_SOURCE), view(TARGET_LEVEL, BASE_TARGET),
+        items_per_block=ITEMS_PER_BLOCK, epsilon=PGM_EPSILON,
+    )
+    blocks, applied = collect_output_blocks(job, (1,))
+    assert len(applied) == BASE_EXPECTED_RECORDS  # drained one decision at a time
+    assert flatten_blocks(blocks) == result.records()
 
 
 @pytest.mark.parametrize("name", sorted(ALL_FIXTURES))

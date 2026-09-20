@@ -218,6 +218,12 @@ class FunctionalMergeOracleResult:
     ``blocks`` are the canonical logical output blocks in rank order and ``pgm`` the
     canonical PGM over the exact output key stream.  No physical slot, storage handle or
     observation event appears anywhere in this result.
+
+    The result carries **no execution evidence either**: how the frozen job was stepped is
+    not part of the logical answer, so two logically identical merges compare *equal* as
+    a whole, whatever ``advance(q)`` decomposition drove them (Issue #2 equivalence
+    invariant 6).  Applied-budget evidence is available separately from
+    :func:`collect_output_blocks`.
     """
 
     source_level: int
@@ -231,10 +237,6 @@ class FunctionalMergeOracleResult:
     pgm: BatchPgmIndex
     first_key: Optional[RecordKey]
     last_key: Optional[RecordKey]
-
-    #: The ``advance`` budgets actually applied, in order (evidence of how the frozen job
-    #: was driven; the result itself does not depend on them).
-    advance_schedule: Tuple[int, ...]
 
     @property
     def is_empty(self) -> bool:
@@ -310,8 +312,11 @@ def functional_merge_oracle(
 
     ``items_per_block`` is the target level's block capacity and ``epsilon`` the canonical
     PGM epsilon; both are validated by the frozen configuration.  ``schedule`` optionally
-    fixes the frozen job's ``advance`` budgets — the *result* must not depend on it, which
-    is exactly what the M1 schedule-invariance tests assert.
+    fixes the frozen job's ``advance`` budgets, but it only *drives* the frozen job: no
+    step-decomposition evidence enters the returned result, so the result is identical for
+    every legal schedule (Issue #2 equivalence invariant 6).  When the applied budgets are
+    wanted as evidence, use :func:`collect_output_blocks`, which returns them alongside the
+    blocks it collected.
 
     Nothing here is randomized, nothing is padded, nothing is written anywhere: the merge
     is decided record by record inside the trusted domain and observed only as its logical
@@ -327,7 +332,10 @@ def functional_merge_oracle(
         items_per_block=items_per_block,
         epsilon=epsilon,
     )
-    blocks, applied = collect_output_blocks(job, schedule)
+    # the step decomposition that drove the frozen job is deliberately discarded here:
+    # the logical oracle result must not depend on it (see collect_output_blocks for the
+    # evaluator-facing evidence).
+    blocks, _applied = collect_output_blocks(job, schedule)
     merged = job.finalize()
     _check_canonical_packing(
         blocks, job.config.items_per_block, merged.record_count, merged.block_count
@@ -345,5 +353,4 @@ def functional_merge_oracle(
         pgm=merged.pgm,
         first_key=merged.first_key,
         last_key=merged.last_key,
-        advance_schedule=applied,
     )

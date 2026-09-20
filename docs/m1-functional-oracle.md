@@ -25,7 +25,8 @@ result = functional_merge_oracle(
     target,                  # LogicalRunView (level L+1, older) - frozen type
     items_per_block=8,       # target level's block capacity, >= 1
     epsilon=8,               # canonical PGM epsilon, >= 0
-    schedule=None,           # optional advance() budgets; the result must not depend on it
+    schedule=None,           # optional advance() budgets driving the frozen job; not
+                             # part of the result (see collect_output_blocks)
 )
 ```
 
@@ -41,11 +42,16 @@ result = functional_merge_oracle(
 | `blocks` | the canonical logical output blocks, in rank order |
 | `pgm` | the canonical PGM over the exact output key stream |
 | `first_key`, `last_key` | the merged key extremes (`None` when empty) |
-| `advance_schedule` | the `advance` budgets actually applied (evidence, not semantics) |
 
 plus `is_empty`, `records()`, `keys()`, and the module helpers `flatten_blocks(blocks)`,
 `output_key_stream(blocks)`, `collect_output_blocks(job, schedule)`,
 `DEFAULT_SCHEDULE_POLICY`, `FunctionalOracleError`.
+
+The result deliberately contains **no execution evidence**: which `advance(q)` budgets
+drove the frozen job is not part of the logical answer, so two logically identical merges
+compare *equal* as a whole.  When the applied budgets are wanted (as evaluator or test
+evidence), `collect_output_blocks(job, schedule)` returns them alongside the blocks it
+collected; they never enter the oracle result.
 
 Errors: `FunctionalOracleError` subclasses the frozen
 `enhanced_letindex.incremental_merge.IncrementalMergeError`, so one vocabulary covers both
@@ -129,8 +135,9 @@ invalid `items_per_block`, `epsilon` and schedules.
 4. output keys strictly increase;
 5. the finalized PGM equals `build_batch_pgm(exact_output_keys, epsilon)` and its
    segmentation equals `make_segmentation(exact_output_keys, epsilon)`;
-6. the result is invariant across several `advance(q)` schedules and is bit-identical
-   between runs;
+6. the result is **equal as a whole** (`assert result == reference`) across several
+   `advance(q)` schedules, and bit-identical between runs — the oracle result exposes no
+   step-decomposition field in which two logically identical runs could differ;
 7. no physical I/O and no observation event is produced (instrumented).
 
 ## 8. Milestones
