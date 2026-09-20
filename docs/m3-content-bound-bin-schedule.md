@@ -177,6 +177,23 @@ falls outside `[0, bin_count)`.  Those invariants are re-derived in the schedule
 constructor, so a hand-built schedule with a missing, duplicated or out-of-range bin is
 refused rather than trusted.
 
+**Relation to the pinned loop — the `else if` fallback is real.**  The pinned `DOMerge` loop
+runs `binCnt = leftBinCnt + rightBinCnt` iterations with `j0`/`j1` state, and its
+`else if` branch is *not* dead code: when a tag's own side is exhausted it fetches from the
+other side.  Example: the source has already fetched its last bin while the target still has
+unread bins, and a later source tag arrives — the `left && ...` branch fails and the target's
+next bin is fetched.  M3's rule ("a side's next unread bin is fetched when that side's own tag
+arrives, if one exists") is therefore **not** the same state machine; it is the *projection* of
+the pinned machine onto actual bin fetches, with no-op iterations and the deferred
+safe-output/frontier work dropped.  On well-formed input the projected sequences are identical
+(asserted by an independent pinned-loop regression over a fixture that really does trigger the
+fallback, plus a sweep of ordinary fixtures), because once a side is exhausted no further
+same-side fetch can happen, so a fallback fetch only pulls the other side's next bin forward.
+
+**M4 must not assume `1 M3 read == 1 DOMerge iteration`.**  When M4 introduces the `j0`/`j1`
+safe-output/frontier state it must replay the original per-tag loop and its fallback, not a
+one-read-per-step abstraction of M3's schedule.
+
 A read is an `AbstractBinRead(side, bin_index)` and nothing else — no slot, handle or storage
 reference.
 

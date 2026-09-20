@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import inspect
 import json
 import math
 import os
@@ -26,6 +27,7 @@ from enhanced_letindex.pgm import build_batch_pgm
 from enhanced_letindex.record import Record
 
 from swat_m_block import (
+    SwatBlockAllocationConfig,
     allocate_block_bins,
     functional_merge_oracle,
     swat_reference_config,
@@ -42,12 +44,14 @@ from swat_m_block.content_schedule import (
     ContentScheduleError,
     InteriorPoint,
     LogicalBlockRunView,
+    LogicalBlockSnapshot,
     SwatBlockMergeSchedule,
     TaggedBinInteriorPoint,
     bind_block_allocation,
     build_abstract_merge_schedule,
     interior_point_sort_key,
     interior_point_weights,
+    interior_stream_domain,
     plan_swat_block_merge_schedule,
     sample_bin_interior_points,
     sorted_tagged_interior_points,
@@ -100,6 +104,57 @@ def make_run(level: int, keys, *, ipb: int = IPB, id_base: int = 0, value_of=Non
         for index in range(0, len(keys), ipb)
     ]
     return LogicalBlockRunView(level=level, blocks=tuple(blocks), items_per_block=ipb)
+
+
+def make_run_with_blocks(level, keys, *, ipb=IPB, id_base=0):
+    """The same run, plus the caller-owned mutable Block objects behind it."""
+    blocks = [
+        make_block(id_base + index // ipb, keys[index:index + ipb], ipb=ipb)
+        for index in range(0, len(keys), ipb)
+    ]
+    return LogicalBlockRunView(level, tuple(blocks), ipb), blocks
+
+
+def make_run_with_bin_starts(level, bin_start_keys, block_count, id_base, *, ipb=IPB):
+    """A run whose bin-starting blocks begin at requested first keys (fallback fixture)."""
+    keys = []
+    next_key = 1
+    for block_index in range(block_count):
+        start = bin_start_keys.get(block_index, next_key)
+        block_keys = [start + offset for offset in range(ipb)]
+        keys.extend(block_keys)
+        next_key = block_keys[-1] + 10
+    return make_run(level, keys, ipb=ipb, id_base=id_base)
+
+
+def pinned_projected_fetches(source_bins, target_bins, tagged):
+    """The pinned ``DOMerge`` loop, projected onto the actual bin-fetch sequence.
+
+    This mirrors ``DOMerger.hpp`` independently of the M3 implementation: the two preloads,
+    then one iteration per sorted tagged interior point, where a left tag fetches the left
+    side's next bin while one remains and **otherwise** the right side's next bin is
+    fetched.  That ``elif`` is a real fallback: a left tag arriving after the left side is
+    exhausted fetches from the right side.  No-op iterations are projected away, and the
+    deferred safe-output work of the pinned loop is not modelled.
+    """
+    fetches = []
+    fallbacks = []
+    if source_bins > 0:
+        fetches.append((SOURCE, 0))
+    if target_bins > 0:
+        fetches.append((TARGET, 0))
+    left_next, right_next = -1, -1
+    for side, _key_order in tagged:
+        is_left_tag = side == SOURCE
+        if is_left_tag and left_next + 2 < source_bins:
+            left_next += 1
+            fetches.append((SOURCE, left_next + 1))
+        elif right_next + 2 < target_bins:
+            right_next += 1
+            fetches.append((TARGET, right_next + 1))
+            if is_left_tag:
+                fallbacks.append((SOURCE, right_next + 1))
+    return fetches, fallbacks
 
 
 def plan_for(blocks: int, seed: int = 7):
@@ -341,10 +396,57 @@ def test_b_no_dummy_block_is_ever_materialised():
     bound = bind_block_allocation(source, source_plan, side=SOURCE)
     for bin_ in bound.bins:
         assert len(bin_.blocks) == bin_.real_block_count
-        assert all(isinstance(block, Block) for block in bin_.blocks)
+        assert all(isinstance(block, LogicalBlockSnapshot) for block in bin_.blocks)
     assert not hasattr(bound, "dummy_blocks")
     assert not hasattr(bound.bins[0], "dummy_blocks")
     assert bound.plan.dummy_count == sum(bin_.dummy_block_count for bin_ in bound.bins)
+
+
+def test_a_the_view_snapshots_caller_owned_blocks():
+    """A frozen view over mutable Blocks must not stay reachable through them."""
+    original = make_block(0, [10, 11, 12])            # capacity 4: one spare slot
+    run = LogicalBlockRunView(level=4, blocks=(original,), items_per_block=IPB)
+    snapshot = run.blocks[0]
+    assert isinstance(snapshot, LogicalBlockSnapshot)
+    assert snapshot is not original
+    before = run.records()
+    original.add_record(Record(RecordKey(1), "INJECTED"))    # below the block's min key
+    assert run.records() == before
+    assert run.keys() == tuple(record.key for record in before)
+    assert snapshot.size == 3
+    assert snapshot.min_key == RecordKey(10)
+    assert snapshot.max_key == RecordKey(12)
+
+
+def test_a_a_later_block_mutation_cannot_change_view_binding_interiors_or_schedule():
+    """Mutation across a bin's block boundary cannot escape the snapshot."""
+    source_run, source_blocks = make_run_with_blocks(4, [10, 11, 12, 13, 20, 21, 22])
+    target_run, target_blocks = make_run_with_blocks(5, [5, 6, 7, 8, 30, 31, 32],
+                                                     id_base=100)
+    source_plan, target_plan = plan_for(2, 7), plan_for(2, 7)
+    assert source_plan.bin_count == 1        # one bin binds both blocks
+    assert source_plan.bins[0].real_count == 2
+    baseline = plan_swat_block_merge_schedule(
+        source_run, target_run, source_plan=source_plan, target_plan=target_plan)
+    baseline_records = source_run.records()
+    baseline_bound = bind_block_allocation(source_run, source_plan, side=SOURCE)
+
+    # mutate the caller-owned originals: the second source block gains a key *below* the
+    # first block's max key, which would break the run's cross-block order if the view
+    # still pointed at the live blocks
+    source_blocks[1].add_record(Record(RecordKey(9), "INJECTED"))
+    target_blocks[1].add_record(Record(RecordKey(40), "INJECTED"))
+    assert source_blocks[1].min_key == RecordKey(9)
+
+    assert source_run.records() == baseline_records
+    assert source_run.keys() == tuple(record.key for record in baseline_records)
+    assert bind_block_allocation(source_run, source_plan, side=SOURCE) == baseline_bound
+    again = plan_swat_block_merge_schedule(
+        source_run, target_run, source_plan=source_plan, target_plan=target_plan)
+    assert structure(again) == structure(baseline)
+    assert again.source.interiors == baseline.source.interiors
+    assert again.target.interiors == baseline.target.interiors
+    assert again.reads == baseline.reads
 
 
 def test_b_a_plan_for_a_different_block_count_is_refused():
@@ -434,8 +536,7 @@ def test_c_an_invalid_load_is_refused(load):
 def test_d_every_real_bin_interior_point_is_an_actual_key_of_that_bin():
     source, _target, source_plan, _ = fixture()
     sampled = sample_bin_interior_points(
-        bind_block_allocation(source, source_plan, side=SOURCE),
-        privacy_epsilon=1.0, seed=7)
+        bind_block_allocation(source, source_plan, side=SOURCE))
     real_bins = 0
     for bin_, point in zip(sampled.bins, sampled.interiors):
         if bin_.is_empty_real:
@@ -453,8 +554,7 @@ def test_d_every_real_bin_interior_point_is_an_actual_key_of_that_bin():
 def test_d_an_empty_real_bin_yields_the_dummy_sentinel():
     source, _target, source_plan, _ = fixture()
     sampled = sample_bin_interior_points(
-        bind_block_allocation(source, source_plan, side=SOURCE),
-        privacy_epsilon=1.0, seed=7)
+        bind_block_allocation(source, source_plan, side=SOURCE))
     for bin_, point in zip(sampled.bins, sampled.interiors):
         if bin_.is_empty_real:
             assert point.is_dummy and point.key is DUMMY_POS_INF
@@ -466,10 +566,9 @@ def test_d_an_empty_real_bin_yields_the_dummy_sentinel():
 def test_d_sampling_twice_is_refused():
     source, _target, source_plan, _ = fixture()
     sampled = sample_bin_interior_points(
-        bind_block_allocation(source, source_plan, side=SOURCE),
-        privacy_epsilon=1.0, seed=7)
+        bind_block_allocation(source, source_plan, side=SOURCE))
     with pytest.raises(ContentScheduleError):
-        sample_bin_interior_points(sampled, privacy_epsilon=1.0, seed=7)
+        sample_bin_interior_points(sampled)
 
 
 def test_d_the_narrow_index_sampler_seam_is_honoured():
@@ -477,7 +576,7 @@ def test_d_the_narrow_index_sampler_seam_is_honoured():
     bound = bind_block_allocation(source, source_plan, side=SOURCE)
     for index in (0, 1):
         sampled = sample_bin_interior_points(
-            bound, privacy_epsilon=1.0, seed=7,
+            bound,
             interior_index_sampler=lambda weights, index=index: min(index, len(weights) - 1))
         for bin_, point in zip(sampled.bins, sampled.interiors):
             if bin_.is_empty_real:
@@ -492,17 +591,51 @@ def test_d_an_out_of_range_index_sampler_is_refused(bad):
     with pytest.raises(ContentScheduleError):
         sample_bin_interior_points(
             bind_block_allocation(source, source_plan, side=SOURCE),
-            privacy_epsilon=1.0, seed=7,
             interior_index_sampler=lambda weights, bad=bad: bad)
 
 
-def test_d_an_invalid_epsilon_or_seed_is_refused():
-    source, _target, source_plan, _ = fixture()
-    bound = bind_block_allocation(source, source_plan, side=SOURCE)
-    with pytest.raises(ContentScheduleError):
-        sample_bin_interior_points(bound, privacy_epsilon=0.0, seed=1)
-    with pytest.raises(ContentScheduleError):
-        sample_bin_interior_points(bound, privacy_epsilon=1.0, seed=-1)
+def test_d_the_public_sampler_exposes_no_randomness_parameter():
+    """The public helper cannot be given an epsilon, a seed or a domain."""
+    parameters = inspect.signature(sample_bin_interior_points).parameters
+    assert list(parameters) == ["bound", "interior_index_sampler"]
+    for forbidden in ("privacy_epsilon", "seed", "domain", "epsilon"):
+        assert forbidden not in parameters, forbidden
+
+
+def test_d_the_frozen_plan_config_is_the_only_source_of_epsilon_and_seed():
+    """Only ``bound.plan.config`` decides the weights and the stream position."""
+    source, _target, _plan, _ = fixture()
+    run = source
+    plan_a = plan_for(run.block_count, 5)
+    sampled_a = sample_bin_interior_points(
+        bind_block_allocation(run, plan_a, side=SOURCE))
+    # a different config seed changes the draws ...
+    plan_b = plan_for(run.block_count, 9)
+    sampled_b = sample_bin_interior_points(
+        bind_block_allocation(run, plan_b, side=SOURCE))
+    assert plan_a.config.seed != plan_b.config.seed
+    assert sampled_a.interiors != sampled_b.interiors
+    # ... and a different privacy_epsilon changes the pinned weights
+    other = SwatBlockAllocationConfig(
+        security_lambda=512, privacy_epsilon=0.25, privacy_delta=1e-12, seed=5)
+    plan_c = allocate_block_bins(run.block_count, other)
+    sampled_c = sample_bin_interior_points(
+        bind_block_allocation(run, plan_c, side=SOURCE))
+    assert plan_c.config.privacy_epsilon == 0.25
+    assert sampled_c.interiors != sampled_a.interiors
+    # the same config reproduces the same evidence exactly
+    assert sample_bin_interior_points(
+        bind_block_allocation(run, plan_a, side=SOURCE)).interiors == sampled_a.interiors
+
+
+def test_d_the_entry_point_takes_each_sides_own_plan_config():
+    source, target, source_plan, target_plan = fixture(seed_source=7, seed_target=11)
+    schedule = plan_swat_block_merge_schedule(
+        source, target, source_plan=source_plan, target_plan=target_plan)
+    assert schedule.source.interiors == sample_bin_interior_points(
+        bind_block_allocation(source, source_plan, side=SOURCE)).interiors
+    assert schedule.target.interiors == sample_bin_interior_points(
+        bind_block_allocation(target, target_plan, side=TARGET)).interiors
 
 
 def test_d_a_non_callable_sampler_is_refused():
@@ -510,12 +643,12 @@ def test_d_a_non_callable_sampler_is_refused():
     with pytest.raises(ContentScheduleError):
         sample_bin_interior_points(
             bind_block_allocation(source, source_plan, side=SOURCE),
-            privacy_epsilon=1.0, seed=1, interior_index_sampler=42)
+            interior_index_sampler=42)
 
 
 def test_d_a_non_allocation_is_refused():
     with pytest.raises(ContentScheduleError):
-        sample_bin_interior_points("bound", privacy_epsilon=1.0, seed=1)
+        sample_bin_interior_points("bound")
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +775,13 @@ def test_f_the_tagged_sequence_holds_one_point_per_bin():
 # ---------------------------------------------------------------------------
 
 
+def test_g_the_interior_domain_is_fixed_by_the_side():
+    assert interior_stream_domain(SOURCE) == STREAM_DOMAIN_INTERIOR_SOURCE
+    assert interior_stream_domain(TARGET) == STREAM_DOMAIN_INTERIOR_TARGET
+    with pytest.raises(ContentScheduleError):
+        interior_stream_domain("middle")
+
+
 def test_g_the_interior_domains_are_separate_from_each_other_and_from_m2():
     domains = (STREAM_DOMAIN_INTERIOR_SOURCE, STREAM_DOMAIN_INTERIOR_TARGET,
                STREAM_DOMAIN_LOADS, STREAM_DOMAIN_LAPLACE)
@@ -656,9 +796,9 @@ def test_g_the_same_config_seed_still_gives_the_two_sides_different_streams():
     run = make_run(4, keys)
     plan = plan_for(run.block_count, 5)
     as_source = sample_bin_interior_points(
-        bind_block_allocation(run, plan, side=SOURCE), privacy_epsilon=1.0, seed=5)
+        bind_block_allocation(run, plan, side=SOURCE))
     as_target = sample_bin_interior_points(
-        bind_block_allocation(run, plan, side=TARGET), privacy_epsilon=1.0, seed=5)
+        bind_block_allocation(run, plan, side=TARGET))
     assert as_source.bin_count == as_target.bin_count
     assert as_source.interiors != as_target.interiors
     assert derive_stream_seed(5, STREAM_DOMAIN_INTERIOR_SOURCE) != \
@@ -857,8 +997,7 @@ def test_h_an_unsampled_side_cannot_be_scheduled():
     source, _target, source_plan, _ = fixture()
     bound = bind_block_allocation(source, source_plan, side=SOURCE)
     sampled_target = sample_bin_interior_points(
-        bind_block_allocation(source, source_plan, side=TARGET),
-        privacy_epsilon=1.0, seed=7)
+        bind_block_allocation(source, source_plan, side=TARGET))
     with pytest.raises(ContentScheduleError):
         build_abstract_merge_schedule(bound, sampled_target)
     with pytest.raises(ContentScheduleError):
@@ -982,7 +1121,7 @@ def test_j_m3_does_not_import_the_m1_oracle_or_a_merge_implementation():
             modules.add(node.module)
     assert modules == {"__future__", "bisect", "math", "random", "dataclasses", "typing",
                        "enhanced_letindex.block", "enhanced_letindex.identifiers",
-                       "bin_allocator", "distribution"}, modules
+                       "enhanced_letindex.record", "bin_allocator", "distribution"}, modules
     joined = " ".join(modules)
     for forbidden in ("functional_oracle", "incremental_merge", "engine", "merge",
                       "storage", "trace", "pgm"):
@@ -1011,6 +1150,80 @@ def test_j_the_record_level_safe_output_frontier_is_not_reimplemented():
     for token in ("newCnt", "new_cnt", "safe_output", "frontier", "additive_error +",
                   "2 * additive", "2 * self.additive"):
         assert token not in code, token
+
+
+#: A fixture whose pinned ``DOMerge`` loop really does trigger the ``else if`` fallback:
+#: the source (3 bins) is exhausted while the target (4 bins) still has unread bins, and a
+#: later source tag arrives.  Bin-start keys were chosen so the tagged order is
+#: t0, s0, s1, s2, t1, t2, t3.
+FALLBACK_SEED = 3
+FALLBACK_SOURCE_BLOCKS = 16
+FALLBACK_TARGET_BLOCKS = 24
+FALLBACK_SOURCE_KEYS = (1_000, 1_128, 1_256)
+FALLBACK_TARGET_KEYS = (1, 2_256, 2_384, 2_516)
+
+
+def fallback_fixture():
+    source_plan = plan_for(FALLBACK_SOURCE_BLOCKS, FALLBACK_SEED)
+    target_plan = plan_for(FALLBACK_TARGET_BLOCKS, FALLBACK_SEED)
+    assert source_plan.bin_count == 3 and target_plan.bin_count == 4
+    assert all(bin_.real_count > 0 for bin_ in source_plan.bins)
+    assert all(bin_.real_count > 0 for bin_ in target_plan.bins)
+    source_starts = dict(zip([bin_.logical_rank_start for bin_ in source_plan.bins],
+                             FALLBACK_SOURCE_KEYS))
+    target_starts = dict(zip([bin_.logical_rank_start for bin_ in target_plan.bins],
+                             FALLBACK_TARGET_KEYS))
+    source_run = make_run_with_bin_starts(
+        4, source_starts, FALLBACK_SOURCE_BLOCKS, 0)
+    target_run = make_run_with_bin_starts(
+        5, target_starts, FALLBACK_TARGET_BLOCKS, 100)
+    return source_run, target_run, source_plan, target_plan
+
+
+def test_h_the_pinned_dom_merge_fallback_fetches_the_same_sequence_as_m3():
+    """The pinned ``else if`` fallback DOES trigger, and the fetch sequence still agrees.
+
+    The pinned loop runs ``source_bin_count + target_bin_count`` iterations and, when a
+    source tag arrives after the source is exhausted, fetches from the target side.  After
+    projecting away no-op iterations (and the deferred safe-output work, which M3 does not
+    model at all), the emitted bin-fetch sequence equals M3's simpler
+    same-side-next-unread schedule on this well-formed input.
+    """
+    source_run, target_run, source_plan, target_plan = fallback_fixture()
+    schedule = plan_swat_block_merge_schedule(
+        source_run, target_run, source_plan=source_plan, target_plan=target_plan,
+        interior_index_sampler=lambda weights: 0)
+    tagged = [(point.side, interior_point_sort_key(point.interior_point))
+              for point in schedule.tagged_interior_points]
+    assert tagged == [(TARGET, (0, 1)), (SOURCE, (0, 1_000)), (SOURCE, (0, 1_128)),
+                      (SOURCE, (0, 1_256)), (TARGET, (0, 2_256)), (TARGET, (0, 2_384)),
+                      (TARGET, (0, 2_516))]
+
+    pinned, fallbacks = pinned_projected_fetches(
+        source_plan.bin_count, target_plan.bin_count, tagged)
+    m3 = [(read.side, read.bin_index) for read in schedule.reads]
+    assert pinned == m3
+    # the fixture must genuinely exercise the fallback: a source tag arriving once the
+    # source is exhausted fetches the target's next unread bin
+    assert fallbacks == [(SOURCE, 2)]
+    # ... and both rules still fetch every planned bin exactly once
+    assert sorted(pinned) == sorted(
+        [(SOURCE, index) for index in range(source_plan.bin_count)]
+        + [(TARGET, index) for index in range(target_plan.bin_count)])
+
+
+def test_h_the_pinned_loop_and_m3_agree_on_every_fixture():
+    """Projected pinned-loop fetches equal M3 reads for a range of fixtures."""
+    for seed in (0, 1, 2, 3, 5, 8):
+        source, target, source_plan, target_plan = fixture(seed_source=seed,
+                                                           seed_target=seed + 1)
+        schedule = plan_swat_block_merge_schedule(
+            source, target, source_plan=source_plan, target_plan=target_plan)
+        tagged = [(point.side, interior_point_sort_key(point.interior_point))
+                  for point in schedule.tagged_interior_points]
+        pinned, _fallbacks = pinned_projected_fetches(
+            source_plan.bin_count, target_plan.bin_count, tagged)
+        assert pinned == [(read.side, read.bin_index) for read in schedule.reads], seed
 
 
 # ---------------------------------------------------------------------------

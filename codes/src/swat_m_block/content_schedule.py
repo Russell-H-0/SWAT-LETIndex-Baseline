@@ -44,7 +44,8 @@ from dataclasses import dataclass, replace
 from typing import Callable, List, Optional, Sequence, Tuple
 
 from enhanced_letindex.block import Block
-from enhanced_letindex.identifiers import RecordKey
+from enhanced_letindex.identifiers import BlockId, RecordKey
+from enhanced_letindex.record import Record
 
 from .bin_allocator import BlockAllocationPlan
 from .distribution import _fast_power as pinned_fast_power, derive_stream_seed
@@ -62,12 +63,14 @@ __all__ = [
     "InteriorPoint",
     "InteriorIndexSampler",
     "LogicalBlockRunView",
+    "LogicalBlockSnapshot",
     "SwatBlockMergeSchedule",
     "TaggedBinInteriorPoint",
     "bind_block_allocation",
     "build_abstract_merge_schedule",
     "interior_point_sort_key",
     "interior_point_weights",
+    "interior_stream_domain",
     "plan_swat_block_merge_schedule",
     "sample_bin_interior_points",
     "sorted_tagged_interior_points",
@@ -119,6 +122,12 @@ DUMMY_POS_INF = _DummyPosInf()
 _SENTINEL_SORT_KEY = (1, 0)
 
 
+def _reject_bound_block(index: int, value: object) -> "LogicalBlockSnapshot":
+    raise ContentScheduleError(
+        f"bin {index} may only bind Block objects, got {type(value).__name__}"
+    )
+
+
 def _require_plain_int(value: object, name: str, *, minimum: Optional[int] = None) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ContentScheduleError(
@@ -154,28 +163,119 @@ def _require_side(side: object) -> str:
 
 
 @dataclass(frozen=True)
+class LogicalBlockSnapshot:
+    """An immutable snapshot of one logical block's content and geometry.
+
+    ``enhanced_letindex.Block`` is *mutable* (``add_record`` keeps it sorted), so a view
+    that held caller-owned ``Block`` objects could be invalidated after it was validated —
+    including across an M2 bin boundary, which the per-bin recheck would not catch.  M3
+    therefore snapshots every block at view construction and binds snapshots only; the
+    caller's original block stays theirs, and nothing they do to it can change a view, a
+    binding, an interior point or a schedule.
+
+    The record tuple is immutable and the records themselves are frozen
+    (:class:`enhanced_letindex.record.Record`); record values remain opaque trusted
+    payloads, exactly as in the frozen substrate.
+    """
+
+    block_id: BlockId
+    capacity: int
+    records: Tuple[Record, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.block_id, BlockId):
+            raise ContentScheduleError(
+                f"a block snapshot needs a BlockId, got {type(self.block_id).__name__}"
+            )
+        capacity = _require_plain_int(self.capacity, "capacity", minimum=1)
+        records = tuple(self.records)
+        for record in records:
+            if not isinstance(record, Record):
+                raise ContentScheduleError(
+                    f"a block snapshot may only hold Record objects, got "
+                    f"{type(record).__name__}"
+                )
+        if len(records) > capacity:
+            raise ContentScheduleError(
+                f"block {self.block_id} holds {len(records)} records, above its capacity "
+                f"{capacity}"
+            )
+        previous = None
+        for record in records:
+            if previous is not None and record.key <= previous:
+                raise ContentScheduleError(
+                    f"block {self.block_id} keys must strictly increase, got "
+                    f"{record.key} after {previous}"
+                )
+            previous = record.key
+        object.__setattr__(self, "capacity", capacity)
+        object.__setattr__(self, "records", records)
+
+    @classmethod
+    def from_block(cls, block: Block) -> "LogicalBlockSnapshot":
+        """Snapshot a caller-owned mutable block."""
+        if not isinstance(block, Block):
+            raise ContentScheduleError(
+                f"a block snapshot needs a Block, got {type(block).__name__}"
+            )
+        return cls(
+            block_id=block.block_id,
+            capacity=block.capacity,
+            records=block.records,
+        )
+
+    @property
+    def size(self) -> int:
+        return len(self.records)
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.records
+
+    @property
+    def is_full(self) -> bool:
+        return self.size >= self.capacity
+
+    @property
+    def min_key(self) -> Optional[RecordKey]:
+        return None if self.is_empty else self.records[0].key
+
+    @property
+    def max_key(self) -> Optional[RecordKey]:
+        return None if self.is_empty else self.records[-1].key
+
+
+@dataclass(frozen=True)
 class LogicalBlockRunView:
     """An immutable trusted view of one level's blocks, with real block boundaries.
 
     Unlike M1's logical run view, this one preserves the **block** structure: M3 binds M2
     bins to actual blocks, so block boundaries must be real and verified.  Construction is
-    pure trusted computation and performs zero storage I/O.
+    pure trusted computation, performs zero storage I/O, and **snapshots** every input block
+    into a :class:`LogicalBlockSnapshot`, so the view cannot be invalidated by a caller
+    mutating a block afterwards.
     """
 
     level: int
-    blocks: Tuple[Block, ...]
+    blocks: Tuple[LogicalBlockSnapshot, ...]
     items_per_block: int
 
     def __post_init__(self) -> None:
         level = _require_plain_int(self.level, "level", minimum=0)
         capacity = _require_plain_int(self.items_per_block, "items_per_block", minimum=1)
-        blocks = tuple(self.blocks)
-        for index, block in enumerate(blocks):
-            if not isinstance(block, Block):
+        snapshots: List[LogicalBlockSnapshot] = []
+        for index, block in enumerate(tuple(self.blocks)):
+            if isinstance(block, LogicalBlockSnapshot):
+                snapshots.append(block)
+            elif isinstance(block, Block):
+                snapshots.append(LogicalBlockSnapshot.from_block(block))
+            else:
                 raise ContentScheduleError(
                     f"a logical block run may only hold Block objects, got "
                     f"{type(block).__name__} at rank {index}"
                 )
+        blocks = tuple(snapshots)
+        for index, block in enumerate(blocks):
             if block.capacity != capacity:
                 raise ContentScheduleError(
                     f"block {block.block_id} has capacity {block.capacity}, but the run "
@@ -186,19 +286,6 @@ class LogicalBlockRunView:
                     f"block {block.block_id} at rank {index} is empty; a logical block "
                     "run holds non-empty blocks only"
                 )
-            if block.size > capacity:
-                raise ContentScheduleError(
-                    f"block {block.block_id} holds {block.size} records, above "
-                    f"items_per_block = {capacity}"
-                )
-            previous = None
-            for record in block.records:
-                if previous is not None and record.key <= previous:
-                    raise ContentScheduleError(
-                        f"block {block.block_id} keys must strictly increase, got "
-                        f"{record.key} after {previous}"
-                    )
-                previous = record.key
         if len({block.block_id for block in blocks}) != len(blocks):
             raise ContentScheduleError("block ids must be unique within a logical run")
         for index, (left, right) in enumerate(zip(blocks, blocks[1:])):
@@ -381,8 +468,9 @@ def _draw_index(stream: "random.Random", weights: Sequence[float]) -> int:
 class BoundBlockBin:
     """One M2 bin bound to the real logical blocks it covers.
 
-    ``blocks`` are the **real** blocks of the bin in logical rank order.  Padding is a
-    count only: M3 materialises no dummy block, and no physical identifier appears here.
+    ``blocks`` are immutable snapshots of the bin's **real** blocks, in logical rank
+    order.  Padding is a count only: M3 materialises no dummy block, and no physical
+    identifier appears here.
     """
 
     bin_index: int
@@ -392,7 +480,7 @@ class BoundBlockBin:
     real_block_count: int
     dummy_block_count: int
     bin_capacity_blocks: int
-    blocks: Tuple[Block, ...]
+    blocks: Tuple[LogicalBlockSnapshot, ...]
 
     def __post_init__(self) -> None:
         index = _require_plain_int(self.bin_index, "bin_index", minimum=0)
@@ -403,7 +491,12 @@ class BoundBlockBin:
         dummy = _require_plain_int(self.dummy_block_count, "dummy_block_count", minimum=0)
         capacity = _require_plain_int(self.bin_capacity_blocks, "bin_capacity_blocks",
                                       minimum=2)
-        blocks = tuple(self.blocks)
+        blocks: Tuple[LogicalBlockSnapshot, ...] = tuple(
+            block if isinstance(block, LogicalBlockSnapshot)
+            else LogicalBlockSnapshot.from_block(block) if isinstance(block, Block)
+            else _reject_bound_block(index, block)
+            for block in self.blocks
+        )
         if len(blocks) != real:
             raise ContentScheduleError(
                 f"bin {index} reports {real} real block(s) but binds {len(blocks)}"
@@ -421,10 +514,6 @@ class BoundBlockBin:
         if load > capacity:
             raise ContentScheduleError(
                 f"bin {index}: sampled_load {load} exceeds bin_capacity_blocks {capacity}"
-            )
-        if any(not isinstance(block, Block) for block in blocks):
-            raise ContentScheduleError(
-                f"bin {index} may only bind Block objects"
             )
         object.__setattr__(self, "bin_index", index)
         object.__setattr__(self, "logical_rank_start", start)
@@ -790,35 +879,26 @@ def bind_block_allocation(
 # ---------------------------------------------------------------------------
 
 
-def _interior_stream(side: str, seed: int, domain: Optional[str]) -> "random.Random":
-    label = domain
-    if label is None:
-        label = (STREAM_DOMAIN_INTERIOR_SOURCE if side == SOURCE
-                 else STREAM_DOMAIN_INTERIOR_TARGET)
-    if not isinstance(label, str) or not label:
-        raise ContentScheduleError(f"an interior-point domain must be a non-empty str")
-    return random.Random(derive_stream_seed(_require_plain_int(seed, "seed", minimum=0),
-                                            label))
+def interior_stream_domain(side: str) -> str:
+    """The interior-point stream domain of one side — fixed by the side, never caller-set."""
+    checked = _require_side(side)
+    return (STREAM_DOMAIN_INTERIOR_SOURCE if checked == SOURCE
+            else STREAM_DOMAIN_INTERIOR_TARGET)
 
 
-def sample_bin_interior_points(
+def _sample_bin_interior_points(
     bound: BoundBlockAllocation,
     *,
     privacy_epsilon: float,
     seed: int,
-    domain: Optional[str] = None,
+    domain: str,
     interior_index_sampler: Optional[InteriorIndexSampler] = None,
 ) -> BoundBlockAllocation:
-    """Sample one pinned interior point per bin of ``bound``.
+    """Private low-level sampler: one pinned interior point per bin of ``bound``.
 
-    A bin with real content yields an interior point drawn from the pinned weight vector
-    over its **actual record keys**; a bin whose real blocks were exhausted by the run
-    yields :data:`DUMMY_POS_INF`.  The stream is planner-owned and domain-separated, so the
-    source and target sides never share a draw sequence even when their configs carry the
-    same seed.
-
-    ``interior_index_sampler`` is the narrow seam for deterministic tie/order tests: it
-    receives one bin's pinned weight vector and returns the chosen record index.
+    The public :func:`sample_bin_interior_points` always calls this with the frozen M2 plan
+    config's ``privacy_epsilon``/``seed`` and the side's fixed domain; the parameters exist
+    here only so that the binding rule is visible in one place.
     """
     if not isinstance(bound, BoundBlockAllocation):
         raise ContentScheduleError(
@@ -827,12 +907,16 @@ def sample_bin_interior_points(
     if bound.is_sampled:
         raise ContentScheduleError("this allocation already carries interior points")
     epsilon = _require_positive_real(privacy_epsilon, "privacy_epsilon")
+    if not isinstance(domain, str) or not domain:
+        raise ContentScheduleError("an interior-point domain must be a non-empty str")
     if interior_index_sampler is not None and not callable(interior_index_sampler):
         raise ContentScheduleError("interior_index_sampler must be callable")
 
     stream = None
     if interior_index_sampler is None:
-        stream = _interior_stream(bound.side, seed, domain)
+        stream = random.Random(
+            derive_stream_seed(_require_plain_int(seed, "seed", minimum=0), domain)
+        )
 
     interiors: List[InteriorPoint] = []
     tagged: List[TaggedBinInteriorPoint] = []
@@ -875,6 +959,42 @@ def sample_bin_interior_points(
     )
 
 
+def sample_bin_interior_points(
+    bound: BoundBlockAllocation,
+    *,
+    interior_index_sampler: Optional[InteriorIndexSampler] = None,
+) -> BoundBlockAllocation:
+    """Sample one pinned interior point per bin of ``bound``.
+
+    A bin with real content yields an interior point drawn from the pinned weight vector
+    over its **actual record keys**; a bin whose real blocks were exhausted by the run
+    yields :data:`DUMMY_POS_INF`.
+
+    The sampling parameters are **not** caller-supplied: ``privacy_epsilon`` and ``seed``
+    come from the frozen M2 plan config this allocation is bound to
+    (``bound.plan.config``) and the stream domain is fixed by ``bound.side``
+    (:func:`interior_stream_domain`).  That keeps the pinned weight expression and the
+    domain separation a property of the frozen plan rather than of a call site: a caller
+    cannot pair an allocation with an unrelated epsilon, reuse another domain, or make the
+    two sides share a stream.
+
+    ``interior_index_sampler`` is the narrow seam for deterministic tie/order tests: it
+    receives one bin's pinned weight vector and returns the chosen record index.
+    """
+    if not isinstance(bound, BoundBlockAllocation):
+        raise ContentScheduleError(
+            f"sampling needs a BoundBlockAllocation, got {type(bound).__name__}"
+        )
+    config = bound.plan.config
+    return _sample_bin_interior_points(
+        bound,
+        privacy_epsilon=config.privacy_epsilon,
+        seed=config.seed,
+        domain=interior_stream_domain(bound.side),
+        interior_index_sampler=interior_index_sampler,
+    )
+
+
 # ---------------------------------------------------------------------------
 # the abstract schedule
 # ---------------------------------------------------------------------------
@@ -902,6 +1022,15 @@ def build_abstract_merge_schedule(
     Skeleton (pinned ``DOMerge``): preload bin 0 of each non-empty side, scan the sorted
     tagged interior points, and when a side's tag arrives request that side's next unread
     bin if one exists.  Each planned bin is therefore fetched exactly once.
+
+    This is the *projection* of the pinned loop onto actual bin fetches, not the pinned
+    per-iteration machine: pinned ``DOMerge`` also runs a fixed ``binCnt`` iteration count,
+    keeps ``j0``/``j1`` state, and has a real ``else if`` fallback (a tag whose own side is
+    exhausted fetches from the other side), interleaved with safe-output/frontier work that
+    this function does not model.  On well-formed input the projected sequences coincide,
+    because once a side is exhausted no further same-side fetch can occur.  A later
+    milestone that introduces that frontier state must replay the pinned loop instead of
+    treating one read here as one merge iteration.
     """
     for side, bound in ((SOURCE, source), (TARGET, target)):
         if not isinstance(bound, BoundBlockAllocation):
@@ -944,8 +1073,9 @@ def plan_swat_block_merge_schedule(
 
     The accepted merge identity is ``source = L`` (newer) into ``target = L + 1`` (older);
     the relation is validated, never inferred from the level magnitudes.  Each side's
-    interior points are drawn with its own M2 config's ``privacy_epsilon`` and ``seed`` but
-    from its own domain, so two sides that share a seed still differ.
+    interior points are drawn from its own frozen M2 plan config
+    (``privacy_epsilon`` and ``seed``) and its own fixed side domain, so two sides that
+    share a config seed still differ.  Neither parameter is a caller choice.
 
     M3 emits no merged output: the exact logical result ``C`` remains the M1 oracle's job.
     """
@@ -973,16 +1103,14 @@ def plan_swat_block_merge_schedule(
                 f"{type(plan).__name__}"
             )
 
+    # each side's interior stream comes from its own frozen M2 plan config
+    # (privacy_epsilon + seed) and its own fixed side domain - never from the caller
     source_bound = sample_bin_interior_points(
         bind_block_allocation(source_run, source_plan, side=SOURCE),
-        privacy_epsilon=source_plan.config.privacy_epsilon,
-        seed=source_plan.config.seed,
         interior_index_sampler=interior_index_sampler,
     )
     target_bound = sample_bin_interior_points(
         bind_block_allocation(target_run, target_plan, side=TARGET),
-        privacy_epsilon=target_plan.config.privacy_epsilon,
-        seed=target_plan.config.seed,
         interior_index_sampler=interior_index_sampler,
     )
     return SwatBlockMergeSchedule(

@@ -134,6 +134,15 @@ reference, and it is an abstract *bin-fetch order*, not a physical read plan: on
 physical fetch will mean fetching a fixed-size padded bin representation, which M3 does not
 define or execute.
 
+**One M3 read is not one pinned `DOMerge` iteration.**  The pinned loop iterates
+`binCnt = leftBinCnt + rightBinCnt` times, carries `j0`/`j1` state and interleaves
+safe-output/frontier work; M3 emits only the *projected* fetch sequence that remains after
+dropping no-op iterations and that deferred work.  The two coincide on well-formed input
+(asserted by an independent pinned-loop regression whose fixture genuinely triggers the
+`else if` fallback), but they are not the same machine.  **M4 must replay the original
+per-tag loop and its fallback semantics when it introduces the `j0`/`j1` frontier state**,
+rather than treating one M3 read as one merge step.
+
 ### 10. Zero physical, slot and trace behaviour
 
 M3 performs:
@@ -192,7 +201,7 @@ decision record.
 |---|---|---|---|
 | D1 | `DPInteriorPoint` is called for **every** bin, including an all-dummy bin, and its distribution is over `bin.size()` slots with zero weight on the dummy tail | M3 samples over the bin's real records only, and a zero-real bin gets the sentinel without drawing | the zero-weight tail can never be selected; and a draw whose result is discarded is a C++ artifact, not semantics. Consequence: the stream offset depends on how many bins have real content — deterministic, but not claimed identical to the pinned call pattern |
 | D2 | an all-dummy bin yields the dummy datum (numeric maximum key) | `DUMMY_POS_INF` sentinel (§5) | Python integers have no maximum; the sentinel's ordering *is* the pinned behaviour |
-| D3 | `DOMerge`'s loop runs `binCnt = leftBinCnt + rightBinCnt` times and falls back to fetching from the *other* side (`else if`) once a side is exhausted | M3 requests a side's next unread bin only when its own tag arrives and a bin remains | the pinned loop count is a ciphertext-drain artifact; with one tag per bin the two rules agree on every well-formed input, and the fallback can never trigger |
+| D3 | `DOMerge`'s loop runs `binCnt = leftBinCnt + rightBinCnt` iterations and, when a tag's own side is exhausted, **falls back to fetching from the other side** (`else if`) | M3 requests a side's next unread bin only when its own tag arrives and a bin remains; it models no loop count and no per-iteration state | the fallback is **real**, not dead code: with the source exhausted while the target still holds unread bins, a later source tag does fetch from the target side. What holds is narrower — after projecting away no-op iterations *and* the deferred safe-output work (which M3 does not model at all), the **emitted bin-fetch sequence** equals M3's on every well-formed input, because once a side is exhausted no further same-side fetch can occur, so a fallback fetch only ever pulls the other side's next bin forward to an earlier iteration without reordering the sequence. M3 reproduces that projected sequence, **not** the pinned per-iteration machine — see §9 |
 | D4 | `static std::mt19937` inside `DPInteriorPoint`, shared across calls | planner-owned stream taken per side and per sampling call | the pinned generator's lifetime spans calls and therefore depends on call order; M3's evidence must depend only on the plan, contents and seed |
 | D5 | the pinned weight vector is built over `bin.size()` (slots) | built over the real record count | same selection behaviour, fewer entries; documented so the correspondence is explicit |
 
