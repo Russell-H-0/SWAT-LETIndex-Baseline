@@ -61,8 +61,8 @@ BYTE_IDENTICAL_TEST_FILES = (
 DERIVED_TEST_FILES = ("test_incremental_merge.py", "test_pgm_rank_certificate.py")
 DERIVATION_MARKER = "DERIVED TEST, NOT BYTE-IDENTICAL IMPORT"
 
-#: Tests written for this repository.
-REPO_TEST_FILES = ("test_m0_provenance_gate.py",)
+#: Tests written for this repository (M0 gates + the M1 focused suite).
+REPO_TEST_FILES = ("test_m0_provenance_gate.py", "test_m1_functional_oracle.py")
 
 
 def _load_verify_module():
@@ -291,30 +291,42 @@ def test_imported_tests_do_not_import_an_excluded_defense_module():
 # ---------------------------------------------------------------------------
 
 
-def test_swat_m_block_package_is_a_marker_only():
+def test_swat_m_block_package_holds_only_the_m1_functional_oracle():
+    """M0 shipped a marker-only package; M1 (Issue #2) authorises the oracle module.
+
+    The package must still hold nothing but its initialiser and the M1 oracle: no second
+    module may appear without its own milestone and decision record.
+    """
+    assert {item.name for item in SWAT_PACKAGE.glob("*.py")} == {
+        "__init__.py", "functional_oracle.py"
+    }
     path = SWAT_PACKAGE / "__init__.py"
-    assert path.is_file()
-    assert {item.name for item in SWAT_PACKAGE.glob("*.py")} == {"__init__.py"}
     source = path.read_text(encoding="utf-8")
     tree = ast.parse(source)
     defined = [
         node.name for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
     ]
-    assert defined == []
-    assert not any(
-        isinstance(node, (ast.Import, ast.ImportFrom)) for node in ast.walk(tree)
-    ), "the M0 package marker must not import anything"
-    assert "__all__: list[str] = []" in source
+    assert defined == [], "the package initialiser must not define behaviour"
+    assert "functional_merge_oracle" in source
+    assert "__all__" in source
 
 
-def test_no_swat_m_block_algorithm_is_implemented():
-    """No M0-authored module may implement the SWAT-M-Block mechanism."""
+def test_no_swat_privacy_or_physical_mechanism_is_implemented():
+    """M1 authorises a *functional* oracle only; no mechanism may be implemented.
+
+    The M0 guard refused any SWAT-M-Block algorithm.  M1 (Issue #2) legitimately adds the
+    logical oracle, so this guard now refuses the mechanisms M1 explicitly excludes: the
+    noisy/padded allocation, the DO merge, the padding, the output permutation, the PRP
+    writeback, de-amortisation and every physical/observational surface.
+    """
     forbidden = (
         "DOAllocate", "DOMerge", "DOMerger", "differential_oblivious",
         "do_allocate", "do_merge", "bin_allocator", "BinAllocator",
         "noisy_allocat", "output_shuffle", "oblivious_shuffle", "bitonic",
         "sorting_network", "deamortiz", "de_amortiz", "epsilon_delta",
+        "UntrustedStorage", "TraceEvent", "TraceOperation", "SlotId",
+        "prp_writeback", "padded_bin", "physical_slot",
     )
     owned = [
         path for path in _iter_repo_files(".py")
@@ -368,14 +380,16 @@ def test_decision_0002_freezes_the_contract_without_claiming_differential_oblivi
     assert SWAT_REFERENCE_COMMIT in text
 
 
-def test_project_state_says_m1_is_not_started():
+def test_project_state_records_m1_as_current_and_m2_as_not_started():
     text = _normalised(REPO_ROOT / "PROJECT-STATE.md")
-    assert "M0 — Repository / bootstrap freeze" in text
+    assert "M0 — repository / bootstrap freeze" in text
     assert "M1 — Functional SWAT-M-Block oracle" in text
-    assert "NOT STARTED" in text
+    assert "M2 — SWAT-style noisy/padded block-bin allocation" in text
+    assert "NOT AUTHORIZED by M1 and NOT STARTED" in text
     for item in (
-        "noisy bin allocation", "DO merge", "dummy / cover block I/O",
-        "output oblivious shuffle", "de-amortisation", "attacks",
-        "performance experiments",
+        "noisy bin allocation / padded bins", "DOAllocate / DOMerge",
+        "dummy / cover block I/O", "output oblivious shuffle",
+        "PRP writeback / physical publication", "de-amortisation",
+        "physical-slot scheduling of any kind", "attacks", "performance experiments",
     ):
         assert item in text, item
