@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# virtualenvs / tooling
+.venv/
+venv/
+env/
+*.egg-info/
+build/
+dist/
+
+# IDE / editor / OS scratch
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

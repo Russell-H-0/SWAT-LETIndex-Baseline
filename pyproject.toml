@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "swat-letindex-baseline"
+version = "0.1.0"
+description = "SWAT-M-Block: block-granular SWAT-style merge baseline over the frozen LETIndex substrate (M0 bootstrap)."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+where = ["codes/src"]
+
+# The canonical codes workflow lives in codes/pyproject.toml
+# (cd codes && python -m pytest -q -p no:cacheprovider).
+# This root config makes the same suite runnable from the repository root.
+[tool.pytest.ini_options]
+testpaths = ["codes/tests"]
+pythonpath = ["codes/src"]
+addopts = "-q -p no:cacheprovider"

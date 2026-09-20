@@ -1,0 +1,13 @@
+* text=auto
+
+*.py text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.sha256 text eol=lf
+
+# dotfiles own their line endings too, so a checkout is byte-deterministic
+.gitattributes text eol=lf
+.gitignore text eol=lf
