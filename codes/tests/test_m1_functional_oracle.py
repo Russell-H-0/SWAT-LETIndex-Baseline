@@ -66,11 +66,15 @@ FORBIDDEN_MECHANISM_TOKENS = (
     "TraceCollector", "SlotId", "read_slot", "write_slot", "physical_slot",
 )
 
-#: Modules that must not even be imported by the M1 oracle.
+#: Modules that must not be imported anywhere in the M1 oracle: the physical surface
+#: and every excluded EnhancedLETIndex defence implementation.
 FORBIDDEN_IMPORT_SUFFIXES = (
     "storage", "trace", "block_prp", "defense_state", "query_defense", "query_stash",
-    "protected_merge", "deamortized_merge", "defended_index", "random", "secrets",
+    "protected_merge", "deamortized_merge", "defended_index",
 )
+
+#: Randomness sources the *oracle* must never acquire (M2 owns seeded randomness).
+FORBIDDEN_ORACLE_RANDOMNESS = ("random", "secrets", "uuid")
 
 
 # ---------------------------------------------------------------------------
@@ -171,8 +175,23 @@ ALL_FIXTURES = {
 }
 
 
+#: The M1 oracle module.  The guards below state M1's own guarantee — the oracle is
+#: randomness-free and contains no mechanism — so they scan this module rather than the
+#: whole package: M2 (Issue #4) legitimately adds the stochastic block-bin allocation
+#: planner, whose own guards live in ``test_m2_block_bin_allocation.py``.
+M1_MODULE = "functional_oracle.py"
+
+#: The package content authorised so far (M0 marker + M1 oracle + M2 planner).
+SWAT_MODULES = ("__init__.py", "functional_oracle.py", "distribution.py",
+                "bin_allocator.py")
+
+
 def _iter_swat_modules():
     return sorted(SWAT_PACKAGE.glob("*.py"))
+
+
+def _m1_module() -> Path:
+    return SWAT_PACKAGE / M1_MODULE
 
 
 def _code_without_docstrings(path: Path) -> str:
@@ -565,14 +584,18 @@ def test_f_a_malformed_input_run_is_refused_by_the_frozen_view():
 # ---------------------------------------------------------------------------
 
 
-def test_g_the_m1_package_contains_no_forbidden_mechanism_in_executable_code():
-    for path in _iter_swat_modules():
-        code = _code_without_docstrings(path)
-        for token in FORBIDDEN_MECHANISM_TOKENS:
-            assert token not in code, (path.name, token)
+def test_g_the_m1_oracle_module_contains_no_forbidden_mechanism():
+    code = _code_without_docstrings(_m1_module())
+    for token in FORBIDDEN_MECHANISM_TOKENS:
+        assert token not in code, (M1_MODULE, token)
 
 
-def test_g_the_m1_package_imports_no_physical_or_defense_module():
+def test_g_no_swat_m_block_module_imports_a_physical_or_defense_module():
+    """The physical/defence import ban covers every module of the package.
+
+    (The randomness ban below is scoped to the oracle: M2 owns seeded randomness and is
+    guarded separately.)
+    """
     for path in _iter_swat_modules():
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
@@ -584,6 +607,7 @@ def test_g_the_m1_package_imports_no_physical_or_defense_module():
             for dotted in names:
                 assert dotted.rsplit(".", 1)[-1] not in FORBIDDEN_IMPORT_SUFFIXES, (
                     path.name, dotted)
+
 
 
 def test_g_the_m1_oracle_only_imports_the_frozen_common_substrate():
@@ -710,27 +734,26 @@ def test_g_a_full_merge_performs_zero_physical_io_and_emits_zero_trace_events(mo
     assert len(storage.trace) == 0
 
 
-def test_g_the_m1_package_uses_no_randomness():
-    for path in _iter_swat_modules():
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    assert alias.name not in {"random", "secrets", "uuid", "os"}, path.name
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                assert node.module not in {"random", "secrets", "uuid"}, path.name
-            elif isinstance(node, ast.Call):
-                func = node.func
-                name = getattr(func, "attr", getattr(func, "id", ""))
-                assert name not in {"random", "randint", "shuffle", "sample", "choice",
-                                    "urandom", "token_bytes"}, path.name
+def test_g_the_m1_oracle_uses_no_randomness():
+    """M1's oracle stays deterministic: all randomness lives in the M2 planner."""
+    path = _m1_module()
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                assert alias.name not in set(FORBIDDEN_ORACLE_RANDOMNESS) | {"os"}, path.name
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            assert node.module not in FORBIDDEN_ORACLE_RANDOMNESS, path.name
+        elif isinstance(node, ast.Call):
+            func = node.func
+            name = getattr(func, "attr", getattr(func, "id", ""))
+            assert name not in {"random", "randint", "shuffle", "sample", "choice",
+                                "urandom", "token_bytes"}, path.name
 
 
-def test_g_the_m1_package_defines_only_the_oracle_surface():
-    assert {path.name for path in _iter_swat_modules()} == {
-        "__init__.py", "functional_oracle.py"
-    }
-    tree = ast.parse((SWAT_PACKAGE / "functional_oracle.py").read_text(encoding="utf-8"))
+def test_g_the_package_holds_the_m1_oracle_and_the_m2_planner_only():
+    assert {path.name for path in _iter_swat_modules()} == set(SWAT_MODULES)
+    tree = ast.parse(_m1_module().read_text(encoding="utf-8"))
     classes = [node.name for node in tree.body if isinstance(node, ast.ClassDef)]
     assert classes == ["FunctionalOracleError", "FunctionalMergeOracleResult"]
     public_functions = [
